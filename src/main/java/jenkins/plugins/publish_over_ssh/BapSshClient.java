@@ -37,19 +37,14 @@ import jenkins.plugins.publish_over.BPBuildInfo;
 import jenkins.plugins.publish_over.BPDefaultClient;
 import jenkins.plugins.publish_over.BapPublisherException;
 
+import net.sf.json.JSONObject;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.IOException;
-import java.io.OutputStream;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Stack;
-import java.util.Vector;
+import java.io.*;
+import java.security.MessageDigest;
+import java.util.*;
 
 @SuppressWarnings("PMD.TooManyMethods")
 public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
@@ -61,12 +56,20 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     private final boolean disableExec;
     private ChannelSftp sftp;
 
+    // add by dongping 20210130 begin
+    // md5结果对象，<项目，<文件名，md5值>>
+    private JSONObject md5AllJSONObject;
+
+    //md5文件名
+    private final File md5File = new File(System.getProperty("user.dir") + "/.md5");
+    // add by dongping 20210130 end
+
     public BapSshClient(final BPBuildInfo buildInfo, final Session session) {
         this(buildInfo, session, false);
     }
 
     public BapSshClient(final BPBuildInfo buildInfo, final Session session, final boolean disableExec) {
-        this.buildInfo = buildInfo;        
+        this.buildInfo = buildInfo;
         this.disableExec = disableExec;
         addSession(session);
     }
@@ -96,6 +99,11 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     }
 
     public void beginTransfers(final BapSshTransfer transfer) {
+        // add by dongping 20210130 begin
+        buildInfo.printIfVerbose("beginTransfers.");
+        initMd5Data();
+        // add by dongping 20210130 end
+
         if (disableExec) {
             if (!transfer.hasConfiguredSourceFiles())
                 throw new BapPublisherException(Messages.exception_badTransferConfig_noExec());
@@ -104,6 +112,60 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
                 throw new BapPublisherException(Messages.exception_badTransferConfig());
         }
     }
+
+    // add by dongping 20210130 begin
+    /**
+     * 初始化md5map
+     */
+    private synchronized void initMd5Data(){
+        // 读取md5文件
+        String md5String = null;
+        try {
+            if (md5File.exists()) {
+                // 文件存在则读取
+                md5String = FileUtils.readFileToString(md5File, "utf-8");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("读取文件错误，md5File: " + md5File);
+        }
+        if (md5String != null){
+            md5AllJSONObject = JSONObject.fromObject(md5String);
+        }else{
+            md5AllJSONObject = new JSONObject();
+        }
+
+        String jobName = buildInfo.getEnvVars().get("JOB_NAME");
+        if (md5AllJSONObject.get(jobName) == null){
+            md5AllJSONObject.put(jobName, new JSONObject());
+        }
+    }
+
+    /**
+     * 计算md5值
+     * @param file
+     * @return
+     * @throws SftpException
+     */
+    public String md5(File file) throws SftpException {
+        byte[] md5Crypt;
+        try {
+            byte[] fileBytes = FileUtils.readFileToByteArray(file);
+            md5Crypt = MessageDigest.getInstance("MD5").digest(fileBytes);
+        } catch (Exception e) {
+            LOG.error("md5处理错误", e);
+            throw new SftpException(10001, e.getMessage());
+        }
+
+        StringBuffer md5StrBuff = new StringBuffer();
+        for (int i = 0; i < md5Crypt.length; i++) {
+            if (Integer.toHexString(0xFF & md5Crypt[i]).length() == 1)
+                md5StrBuff.append("0").append(Integer.toHexString(0xFF & md5Crypt[i]));
+            else
+                md5StrBuff.append(Integer.toHexString(0xFF & md5Crypt[i]));
+        }
+        return md5StrBuff.toString();
+    }
+    // add by dongping 20210130 end
 
     public boolean changeDirectory(final String directory) {
         try {
@@ -181,7 +243,23 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     public void transferFile(final BapSshTransfer bapSshTransfer, final FilePath filePath,
                              final InputStream inputStream) throws SftpException {
         buildInfo.printIfVerbose(Messages.console_put(filePath.getName()));
-        sftp.put(inputStream, filePath.getName());
+
+        // modify by dongping 20210130 begin
+        String jobName = buildInfo.getEnvVars().get("JOB_NAME");
+        JSONObject md5JsonObject = (JSONObject)md5AllJSONObject.get(jobName);
+        String md5Key = filePath.getRemote();
+        String md5Crypt = md5(new File(md5Key));
+        String oldMd5Crypt = (String) md5JsonObject.get(md5Key);
+        if (oldMd5Crypt == null || !oldMd5Crypt.equals(md5Crypt)){
+            // 没有此文件记录或md5和旧记录不相同，传输文件，并记录md5
+            sftp.put(inputStream, filePath.getName());
+            md5JsonObject.put(md5Key, md5Crypt);
+        }else {
+            String existMessage = String.format("[%s] is not changed.", filePath.getName());
+            buildInfo.printIfVerbose(existMessage);
+        }
+        // modify by dongping 20210130 end
+
         success();
     }
 
@@ -194,6 +272,15 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     }
 
     public void endTransfers(final BapSshTransfer transfer) {
+        // add by dongping 20210130 begin
+        buildInfo.printIfVerbose("endTransfers.");
+        try {
+            FileUtils.write(md5File, md5AllJSONObject.toString(), "utf-8");
+        } catch (IOException e) {
+            LOG.error("写入文件错误。md5File: " + md5File, e);
+        }
+        // add by dongping 20210130 begin
+
         if (!disableExec && transfer.hasExecCommand()) {
             if (transfer.isUseSftpForExec())
                 sftpExec(transfer);

@@ -33,3 +33,7 @@ work/
 .settings/
 .classpath
 .project
+
+.md5
+.github
+.mvn
