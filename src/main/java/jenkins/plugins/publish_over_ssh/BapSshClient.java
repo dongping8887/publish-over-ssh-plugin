@@ -61,7 +61,7 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     private JSONObject md5AllJSONObject;
 
     //md5文件名
-    private final File md5File = new File(System.getProperty("user.dir") + "/.md5");
+    private final File md5File = new File(System.getProperty("user.home") + "/.md5");
     // add by dongping 20210130 end
 
     public BapSshClient(final BPBuildInfo buildInfo, final Session session) {
@@ -101,7 +101,8 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     public void beginTransfers(final BapSshTransfer transfer) {
         // add by dongping 20210130 begin
         buildInfo.printIfVerbose("beginTransfers.");
-        initMd5Data();
+        buildInfo.printIfVerbose("transfer: " + transfer);
+        initMd5Data(transfer);
         // add by dongping 20210130 end
 
         if (disableExec) {
@@ -117,7 +118,7 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
     /**
      * 初始化md5map
      */
-    private synchronized void initMd5Data(){
+    private synchronized void initMd5Data(BapSshTransfer transfer){
         // 读取md5文件
         String md5String = null;
         try {
@@ -135,7 +136,8 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
         }
 
         String jobName = buildInfo.getEnvVars().get("JOB_NAME");
-        if (md5AllJSONObject.get(jobName) == null){
+        if (md5AllJSONObject.get(jobName) == null || transfer.isCleanRemote() || transfer.isRemoteDirectorySDF()){
+            // 不存在此任务md5或者需要清除远端文件
             md5AllJSONObject.put(jobName, new JSONObject());
         }
     }
@@ -250,8 +252,17 @@ public class BapSshClient extends BPDefaultClient<BapSshTransfer> {
         String md5Key = filePath.getRemote();
         String md5Crypt = md5(new File(md5Key));
         String oldMd5Crypt = (String) md5JsonObject.get(md5Key);
-        if (oldMd5Crypt == null || !oldMd5Crypt.equals(md5Crypt)){
-            // 没有此文件记录或md5和旧记录不相同，传输文件，并记录md5
+
+        // 获取文件信息
+        String remoteFilePath = sftp.pwd() + "/" + filePath.getName();
+        Vector vector = null;
+        try{
+            vector = sftp.ls(remoteFilePath);
+        }catch (Exception e){
+            // 可能会出现[No such file]的异常
+        }
+        if (oldMd5Crypt == null || !oldMd5Crypt.equals(md5Crypt) || vector == null){
+            // 没有此文件记录或md5和旧记录不相同或远端未查询到此文件，传输文件，并记录md5
             sftp.put(inputStream, filePath.getName());
             md5JsonObject.put(md5Key, md5Crypt);
         }else {
